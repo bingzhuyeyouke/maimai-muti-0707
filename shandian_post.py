@@ -223,7 +223,6 @@ def run(
     text: str = None,
     file_path: str = None,
     dry_run: bool = False,
-    limit: int = 10,
     skip_image: bool = False,
     pexels_only: bool = False,
 ):
@@ -259,12 +258,8 @@ def run(
         logger.error("❌ 没有解析出任何帖子")
         return False
 
-    # 限制话题数量
+    # 统计话题数
     unique_topics = list(dict.fromkeys(p['topic'] for p in posts))
-    if len(unique_topics) > limit:
-        allowed_topics = unique_topics[:limit]
-        posts = [p for p in posts if p['topic'] in allowed_topics]
-        logger.warning(f"⚠️ 话题数超过限制，只保留前 {limit} 个")
 
     # 搜索图片
     topic_images = search_topic_images(posts, skip_image, pexels_only)
@@ -327,7 +322,6 @@ if __name__ == "__main__":
     cli.add_argument("--posts", type=str, help="直接传入帖子内容")
     cli.add_argument("--file", type=str, help="从文件读取帖子内容")
     cli.add_argument("--dry-run", action="store_true", help="干跑模式")
-    cli.add_argument("--limit", type=int, default=10, help="最多处理几个话题（默认10）")
     cli.add_argument("--no-image", action="store_true", help="跳过图片搜索")
     cli.add_argument("--pexels-only", action="store_true", help="只用Pexels搜图（跳过网页搜图，避免Playwright冲突）")
 
@@ -335,12 +329,11 @@ if __name__ == "__main__":
 
     if not args.posts and not args.file:
         # 交互模式
-        success = run(dry_run=args.dry_run, limit=args.limit, skip_image=args.no_image, pexels_only=args.pexels_only)
+        success = run(dry_run=args.dry_run, skip_image=args.no_image, pexels_only=args.pexels_only)
     elif args.file:
         success = run(
             file_path=args.file,
             dry_run=args.dry_run,
-            limit=args.limit,
             skip_image=args.no_image,
             pexels_only=args.pexels_only,
         )
@@ -348,7 +341,6 @@ if __name__ == "__main__":
         success = run(
             text=args.posts,
             dry_run=args.dry_run,
-            limit=args.limit,
             skip_image=args.no_image,
             pexels_only=args.pexels_only,
         )
