@@ -31,6 +31,12 @@ class Settings(BaseSettings):
         default=210,
         description="闪电观察者发帖间隔基准（秒），±30秒抖动，默认210秒≈3-4分钟",
     )
+
+    # ---------- MultiPost 多平台发布 ----------
+    multipost_post_interval: int = Field(
+        default=180,
+        description="MultiPost 发帖间隔基准（秒），±30秒抖动，默认180秒≈3分钟，与脉脉发帖节奏同步",
+    )
     pexels_api_key: str = Field(
         default="",
         description="Pexels API Key（免费申请：https://www.pexels.com/api/）",

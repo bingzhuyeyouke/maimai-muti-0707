@@ -28,5 +28,10 @@ posts/images/
 # 闪电观察者下载的图片（临时，不提交）
 posts/shandian_images/
 
+# 多平台发布临时图片和帖子文件
+posts/multi_*_images/
+posts/multi_*_posts.txt
+posts/test_flow_posts.txt
+
 # macOS
 .DS_Store
