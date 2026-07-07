@@ -156,6 +156,10 @@ def start_chrome():
         chrome_path,
         f"--remote-debugging-port={DEBUG_PORT}",
         f"--user-data-dir={CHROME_USER_DATA}",
+        "--disable-popup-blocking",        # 减少弹窗提示，让扩展打开标签页更顺畅
+        "--disable-background-timer-throttling",  # 后台标签页不受限
+        "--disable-renderer-backgrounding",       # 后台渲染不被抑制
+        "--disable-backgrounding-occluded-windows",  # 遮挡时仍正常运行
     ]
 
     # 在后台启动

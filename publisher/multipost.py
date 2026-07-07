@@ -9,16 +9,20 @@ MultiPost 发布模块 —— 自动操作 MultiPost 网页端发布内容到多
   5. 点击「下一步」（蓝色箭头按钮）
   6. 取消全选，勾选目标平台（头条/公众号）
   7. 点击发布按钮
-  8. 检测新打开的平台标签页
-  9. 在各平台标签页中填入标题、正文、分类，点击各平台发布按钮
+  8. 等待平台标签页打开，按优先级处理（脉脉→公众号→头条）
+  9. 发布完成后自动清理标签页
 
 ⚠️  前置条件：
   - 用户需要先启动 Chrome 并打开远程调试端口：
-    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-      --remote-debugging-port=9222 \
-      --user-data-dir=/tmp/chrome-automation-profile
+    macOS:
+      /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\
+        --remote-debugging-port=9222 \\
+        --user-data-dir=/tmp/chrome-automation-profile
+    Windows:
+      chrome.exe --remote-debugging-port=9222 --user-data-dir=%TEMP%\\chrome-automation-profile
+  - 或直接运行: python3 start_chrome.py
   - 用户需要已登录 MultiPost（multipost.app）
-  - 用户需要已登录各目标平台（头条/公众号）
+  - 用户需要已登录各目标平台（头条/公众号/脉脉）
 
 ⚠️  风险提示：
   - 发布是真实操作，会在平台上创建真实内容
@@ -26,7 +30,10 @@ MultiPost 发布模块 —— 自动操作 MultiPost 网页端发布内容到多
   - 不要短时间内大量发布，可能触发平台风控
 """
 
+import json
+import platform
 import time
+import urllib.request
 from typing import Optional
 
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
@@ -43,8 +50,14 @@ CDP_URL = "http://localhost:9222"
 # MultiPost 编辑器地址
 MULTIPOST_URL = "https://multipost.app/"
 
-# 默认要发布的平台
-DEFAULT_PLATFORMS = ["微信公众号", "今日头条"]
+# 脉脉社区首页（发帖入口）
+MAIMAI_HOME_URL = "https://maimai.cn/community/home/recommended"
+
+# 脉脉默认话题
+DEFAULT_TOPIC = "我来爆个料"
+
+# 默认要发布的平台（优先级顺序：脉脉 → 公众号 → 头条）
+DEFAULT_PLATFORMS = ["脉脉", "微信公众号", "今日头条"]
 
 # MultiPost 扩展 ID
 MULTIPOST_EXT_ID = "dhohkaclnjgcikfoaacfgijgjgceofih"
@@ -91,10 +104,16 @@ class MultiPostPublisher:
         except Exception as e:
             logger.error(f"❌ 连接 Chrome 失败: {e}")
             logger.info("请先启动 Chrome（带调试端口）：")
-            logger.info(
-                "  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
-                "--remote-debugging-port=9222 "
-                "--user-data-dir=/tmp/chrome-automation-profile"
+            if platform.system() == "Windows":
+                logger.info(
+                    "  chrome.exe --remote-debugging-port=9222 "
+                    "--user-data-dir=%TEMP%\\chrome-automation-profile"
+                )
+            else:
+                logger.info(
+                    "  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
+                    "--remote-debugging-port=9222 "
+                    "--user-data-dir=/tmp/chrome-automation-profile"
             )
             return False
 
@@ -104,6 +123,29 @@ class MultiPostPublisher:
         if self._playwright:
             self._playwright.stop()
         logger.info("已断开 Chrome 连接")
+
+    def _reconnect(self):
+        """
+        重连 Playwright 以刷新页面列表
+
+        当 Chrome 扩展（如 MultiPost）打开新标签页时，
+        Playwright 的 CDP 连接不会自动追踪这些新页面。
+        断开并重新连接可以获取最新的页面列表。
+        """
+        try:
+            self._playwright.stop()
+        except Exception:
+            pass
+
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.connect_over_cdp(CDP_URL)
+        self._context = self._browser.contexts[0] if self._browser.contexts else None
+
+        if self._context:
+            page_count = len(self._context.pages)
+            logger.info(f"  ✓ 已重连，当前 {page_count} 个标签页")
+        else:
+            logger.warning("  ⚠️ 重连后未找到浏览器上下文")
 
     def publish(
         self,
@@ -152,8 +194,8 @@ class MultiPostPublisher:
                 page.screenshot(path="debug_screenshots/dry_run_preview.png", full_page=True)
                 return True
 
-            # 第6步：点击发布 + 处理平台标签页
-            result = self._click_publish(page, title, body)
+            # 第6步：点击发布 + 处理平台标签页（按优先级：脉脉 → 公众号 → 头条）
+            result = self._click_publish(page, title, body, platforms)
 
             return result
 
@@ -442,12 +484,37 @@ class MultiPostPublisher:
 
         return result.get('found', False)
 
-    def _click_publish(self, page: Page, title: str, body: str) -> bool:
-        """第6步：点击 MultiPost 发布按钮，然后处理各平台标签页"""
+    def _click_publish(self, page: Page, title: str, body: str, platforms: list[str] = None) -> bool:
+        """
+        第6步：点击 MultiPost 发布按钮，等待各平台标签页打开，按优先级处理
+
+        流程：
+          1. 点击发布按钮
+          2. 等待10秒让 MultiPost 弹出各平台编辑器标签页
+          3. 重连 Playwright（因为扩展打开的新标签页不会出现在旧连接中）
+          4. 扫描所有标签页，匹配平台编辑器页面
+          5. 按优先级处理：脉脉 → 公众号 → 头条
+        """
         logger.info("⚠️  即将点击发布按钮，这是真实发布操作！")
 
-        # 记录当前页面数，用于检测新标签页
-        pages_before = len(self._context.pages)
+        # 将中文平台名映射为内部标识
+        platform_map = {
+            '脉脉': 'maimai',
+            '微信公众号': 'wechat',
+            '微信': 'wechat',
+            '公众号': 'wechat',
+            '今日头条': 'toutiao',
+            '头条': 'toutiao',
+        }
+        expected = []
+        if platforms:
+            for p in platforms:
+                key = platform_map.get(p, p)
+                if key not in expected:
+                    expected.append(key)
+
+        if not expected:
+            expected = ['maimai', 'wechat', 'toutiao']
 
         # 点击蓝色发布按钮
         clicked = page.evaluate('''() => {
@@ -468,172 +535,652 @@ class MultiPostPublisher:
         if not clicked:
             raise RuntimeError("未找到发布按钮")
 
-        logger.info("  ✓ MultiPost 发布按钮已点击")
-        time.sleep(5)
+        logger.info("  ✓ MultiPost 发布按钮已点击，等待20秒让所有平台标签页打开...")
+        time.sleep(20)
 
-        # 检测新打开的平台标签页
-        platform_tabs = self._wait_for_platform_tabs(pages_before)
+        # 重连 Playwright 以获取扩展打开的新标签页
+        self._reconnect()
+
+        # 扫描所有标签页，匹配平台编辑器页面
+        platform_tabs = self._scan_all_platform_tabs(expected)
 
         if not platform_tabs:
-            # 没有新标签页，检查 MultiPost 页面状态
-            result = page.evaluate('''() => {
-                const text = document.body.textContent || '';
-                if (text.includes('publish.success') || text.includes('success')) {
-                    return 'success';
-                } else if (text.includes('error') || text.includes('失败')) {
-                    return 'error';
-                }
-                return 'unknown';
-            }''')
+            # 没有找到任何平台标签页，可能 MultiPost 已自动处理完毕
+            logger.warning("⚠️  未检测到平台标签页，MultiPost 可能已自动处理")
+            return True
 
-            if result == 'success':
-                logger.success("🎉 MultiPost 发布成功（未打开平台标签页）")
-                return True
-            elif result == 'error':
-                logger.error("❌ MultiPost 发布失败")
-                return False
-            else:
-                logger.warning("⚠️  发布结果未知，未检测到平台标签页")
-                self._save_screenshot(page, "multipost_after_publish")
-                return True
+        # 按优先级处理平台标签页：脉脉 → 公众号 → 头条
+        # 先切回 MultiPost 页面，减少平台操作时弹窗到前台的干扰
+        self._focus_multipost_page()
 
-        # 逐个处理平台标签页
         results = {}
-        for tab in platform_tabs:
-            platform = self._identify_platform(tab)
-            logger.info(f"  处理平台: {platform}")
+        for platform in self.PLATFORM_PRIORITY:
+            if platform not in platform_tabs:
+                # 该平台标签页未找到，可能已被 MultiPost 自动处理
+                platform_names = {'maimai': '脉脉', 'wechat': '公众号', 'toutiao': '头条'}
+                logger.warning(
+                    f"  ⚠️ [{platform_names.get(platform, platform)}] 标签页未找到，"
+                    f"可能已被 MultiPost 自动处理或尚未打开"
+                )
+                continue
 
-            if platform == 'toutiao':
-                results['toutiao'] = self._publish_toutiao(tab, title, body)
-            elif platform == 'wechat':
-                results['wechat'] = self._publish_wechat(tab, title, body)
-            else:
-                logger.warning(f"  未知平台，跳过: {tab.url}")
-                results['unknown'] = False
+            tab = platform_tabs[platform]
+            logger.info(f"  处理平台: {platform}（优先级）")
+
+            try:
+                if platform == 'maimai':
+                    results['maimai'] = self._publish_maimai(tab, title, body)
+                elif platform == 'toutiao':
+                    results['toutiao'] = self._publish_toutiao(tab, title, body)
+                elif platform == 'wechat':
+                    results['wechat'] = self._publish_wechat(tab, title, body)
+                else:
+                    logger.warning(f"  未知平台，跳过: {tab.url}")
+            except Exception as e:
+                logger.error(f"  ❌ {platform} 发布异常: {e}")
+                results[platform] = False
 
         # 汇总结果
         for platform, success in results.items():
             status = "✅ 成功" if success else "❌ 失败"
             logger.info(f"  {platform}: {status}")
 
-        known_results = {k: v for k, v in results.items() if k != 'unknown'}
-        if not known_results:
-            return False
+        # 清理已处理的平台标签页，为下一组发布做准备
+        self._cleanup_platform_tabs(platform_tabs)
 
-        all_success = all(known_results.values())
+        # 找到的平台都成功就算成功（未找到的跳过）
+        if not results:
+            logger.warning("  ⚠️ 未找到任何平台标签页进行操作")
+            return True  # MultiPost 可能已经处理了
+
+        all_success = all(results.values())
         if all_success:
-            logger.success("🎉 所有平台发布成功！")
+            logger.success("🎉 所有已找到的平台发布成功！")
         return all_success
+
+    def _cleanup_platform_tabs(self, platform_tabs: dict):
+        """关闭已处理的平台标签页，为下一组发布做准备"""
+        if not platform_tabs:
+            return
+        logger.info("清理平台标签页...")
+        for platform_name, pg in platform_tabs.items():
+            try:
+                if not pg.is_closed():
+                    pg.close()
+                    logger.info(f"  ✓ 已关闭 [{platform_name}] 标签页")
+            except Exception:
+                pass
+
+    def _focus_multipost_page(self):
+        """切回 MultiPost 页面，减少平台操作时弹窗到前台的干扰"""
+        if not self._context:
+            return
+        for pg in self._context.pages:
+            if 'multipost.app' in pg.url and not pg.is_closed():
+                try:
+                    pg.bring_to_front()
+                except Exception:
+                    pass
+                break
 
     # ========== 平台标签页检测与交互 ==========
 
-    def _wait_for_platform_tabs(self, existing_count: int, timeout: int = 15) -> list:
+    # 平台编辑器 URL 特征（MultiPost 弹出的编辑器页面包含这些关键词）
+    PLATFORM_EDITOR_RULES = {
+        'maimai':   ['maimai.cn/community/home'],           # 脉脉社区首页自带发帖框
+        'wechat':   ['appmsg_edit', 'appmsg_edit_v2'],      # 公众号图文编辑器
+        'toutiao':  ['weitoutiao/publish', 'graphic/publish'],  # 头条微头条/图文发布页
+    }
+
+    # 平台处理优先级：脉脉 → 公众号 → 头条（头条放最后因为上传图片耗时更长）
+    PLATFORM_PRIORITY = ['maimai', 'wechat', 'toutiao']
+
+    def _scan_all_platform_tabs(self, expected_platforms: list[str]) -> dict:
         """
-        等待 MultiPost 打开平台标签页
+        扫描当前所有浏览器标签页，匹配平台编辑器页面
+
+        前提：调用前已重连 Playwright，context.pages 包含最新标签页列表
 
         参数:
-            existing_count: 点击发布前的页面数
-            timeout: 最长等待秒数
+            expected_platforms: 期望的平台列表，如 ['maimai', 'wechat', 'toutiao']
 
         返回:
-            新打开的 Page 列表
+            dict: { platform_name: Page } 匹配到的平台标签页
         """
-        logger.info("等待平台标签页打开...")
-        start = time.time()
-        while time.time() - start < timeout:
-            current_pages = self._context.pages
-            if len(current_pages) > existing_count:
-                new_pages = current_pages[existing_count:]
-                logger.info(f"  ✓ 检测到 {len(new_pages)} 个新标签页")
-                return new_pages
-            time.sleep(1)
+        logger.info(f"扫描平台编辑器标签页: {expected_platforms}...")
+        found: dict[str, Page] = {}
 
-        logger.warning("  ⚠️ 未检测到新标签页")
-        return []
+        all_pages = self._context.pages
+        logger.info(f"  当前共 {len(all_pages)} 个标签页")
+
+        for pg in all_pages:
+            if pg.is_closed():
+                continue
+            url = pg.url
+            for platform_name in expected_platforms:
+                if platform_name in found:
+                    continue
+                editor_rules = self.PLATFORM_EDITOR_RULES.get(platform_name, [])
+                if any(rule in url for rule in editor_rules):
+                    found[platform_name] = pg
+                    logger.info(f"  ✓ [{platform_name}] 编辑器已就绪: {url[:100]}")
+
+        if not found:
+            # 打印所有标签页帮助调试
+            logger.warning("  ⚠️ 未找到任何平台编辑器页面，当前标签页:")
+            for pg in all_pages:
+                if not pg.is_closed():
+                    logger.warning(f"    {pg.url[:120]}")
+        else:
+            missing = [p for p in expected_platforms if p not in found]
+            if missing:
+                logger.warning(f"  未找到: {missing}")
+            else:
+                logger.success(f"  ✓ 所有 {len(expected_platforms)} 个平台编辑器已就绪")
+
+        return found
 
     def _identify_platform(self, page: Page) -> str:
         """
         根据 URL 识别平台
 
         返回:
-            'toutiao' / 'wechat' / 'unknown'
+            'maimai' / 'toutiao' / 'wechat' / 'unknown'
         """
         url = page.url
         logger.debug(f"  标签页 URL: {url}")
 
-        if 'mp.toutiao.com' in url or 'toutiao.com' in url:
-            return 'toutiao'
-        elif 'mp.weixin.qq.com' in url or 'weixin.qq.com' in url:
-            return 'wechat'
+        for platform_name, rules in self.PLATFORM_URL_RULES.items():
+            if any(rule in url for rule in rules):
+                return platform_name
 
         # 等待页面跳转完成后再次检查
         time.sleep(3)
         url = page.url
         logger.debug(f"  标签页 URL (等待后): {url}")
 
-        if 'mp.toutiao.com' in url or 'toutiao.com' in url:
-            return 'toutiao'
-        elif 'mp.weixin.qq.com' in url or 'weixin.qq.com' in url:
-            return 'wechat'
+        for platform_name, rules in self.PLATFORM_URL_RULES.items():
+            if any(rule in url for rule in rules):
+                return platform_name
 
         # 未知平台，保存截图用于调试
         self._save_screenshot(page, "unknown_platform_tab")
         logger.warning(f"  未知平台: {url}")
         return 'unknown'
 
+    def _publish_maimai(self, page: Page, title: str, content: str) -> bool:
+        """
+        在脉脉社区发布页面填写内容并发布
+
+        脉脉的特殊之处：MultiPost 复用已有标签页（不打开新标签页），
+        所以这个页面可能是用户之前打开的脉脉页面。
+
+        操作流程：
+          1. 确保编辑器存在（导航到社区首页）
+          2. 切换身份为"职场领域创作者"
+          3. 填入标题和正文
+          4. 添加话题（带重试）
+          5. 勾选两个发布设置开关（同步主页 + 昵称水印）
+          6. 点击「发动态」
+        """
+        logger.info("📝 脉脉：填写内容并发布")
+
+        # 确保在脉脉发帖页面
+        if "maimai.cn" not in page.url:
+            logger.warning("  当前页面不是脉脉，尝试导航...")
+            page.goto(MAIMAI_HOME_URL, wait_until="domcontentloaded", timeout=15000)
+            time.sleep(3)
+
+        # 等待页面加载
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            logger.warning("  脉脉页面加载超时")
+        time.sleep(2)
+
+        self._save_screenshot(page, "maimai_before_fill")
+
+        # 1. 切换身份
+        self._switch_maimai_identity(page)
+
+        # 2. 填标题（脉脉标题为选填，最多20字）
+        if title:
+            self._fill_maimai_title(page, title[:20])
+
+        # 3. 填正文
+        content_ok = self._fill_maimai_content(page, content)
+        if not content_ok:
+            logger.error("  ❌ 脉脉：正文填写失败")
+            self._save_screenshot(page, "maimai_content_fail")
+            return False
+
+        time.sleep(0.5)
+
+        # 4. 添加话题（带重试）
+        self._add_maimai_topic(page, DEFAULT_TOPIC, retries=2)
+
+        # 5. 勾选两个发布设置开关
+        self._check_maimai_publish_settings(page)
+
+        self._save_screenshot(page, "maimai_before_publish")
+
+        # 6. 点击「发动态」
+        publish_clicked = page.evaluate('''() => {
+            // 优先 button
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) {
+                const t = (btn.textContent || '').trim();
+                const rect = btn.getBoundingClientRect();
+                if ((t === '发动态' || t === '发布') && rect.width > 0 && !btn.disabled) {
+                    btn.click();
+                    return { tag: 'button', text: t };
+                }
+            }
+            // 备用
+            const all = document.querySelectorAll('div, span');
+            for (const el of all) {
+                const t = (el.textContent || '').trim();
+                const rect = el.getBoundingClientRect();
+                if ((t === '发动态' || t === '发布') && rect.width > 50 && rect.y > 200) {
+                    el.click();
+                    return { tag: el.tagName, text: t };
+                }
+            }
+            return null;
+        }''')
+
+        if not publish_clicked:
+            logger.warning("  ⚠️ 脉脉：未找到「发动态」按钮")
+            self._save_screenshot(page, "maimai_publish_btn_fail")
+            return False
+
+        logger.info(f"  ✓ 脉脉「发动态」已点击: {publish_clicked}")
+        time.sleep(3)
+
+        self._save_screenshot(page, "maimai_after_publish")
+        logger.success("✓ 脉脉发布完成")
+        return True
+
+    # ========== 脉脉辅助方法 ==========
+
+    def _switch_maimai_identity(self, page: Page):
+        """确保脉脉身份为'职场领域创作者'"""
+        logger.info("  检查脉脉发帖身份...")
+
+        current = page.evaluate('''() => {
+            const all = document.querySelectorAll('span, div');
+            for (const el of all) {
+                const t = (el.textContent || '').trim();
+                const rect = el.getBoundingClientRect();
+                if (t.includes('职场领域创作者') && t.length < 30
+                    && rect.width > 50 && rect.width < 300
+                    && rect.y > 80 && rect.y < 200) {
+                    return t.substring(0, 30);
+                }
+            }
+            return '';
+        }''')
+
+        if '职场领域创作者' in current:
+            logger.info("    ✓ 身份已是职场领域创作者")
+            return
+
+        logger.info("    切换身份为职场领域创作者...")
+
+        # 点击"切换"
+        clicked_switch = page.evaluate('''() => {
+            const all = document.querySelectorAll('span, a, div');
+            for (const el of all) {
+                const t = (el.textContent || '').trim();
+                const rect = el.getBoundingClientRect();
+                if (t === '切换' && rect.y > 80 && rect.y < 200
+                    && rect.width > 10 && rect.width < 80) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }''')
+
+        if not clicked_switch:
+            logger.warning("    ⚠️ 未找到切换按钮")
+            return
+
+        time.sleep(2)
+
+        # 选择"职场领域创作者"
+        selected = page.evaluate('''() => {
+            const all = document.querySelectorAll('span, div, li, p');
+            for (const el of all) {
+                const t = (el.textContent || '').trim();
+                const rect = el.getBoundingClientRect();
+                if (t === '职场领域创作者' && el.children.length === 0
+                    && rect.width > 50 && rect.width < 300) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }''')
+
+        if selected:
+            logger.success("    ✓ 已切换为职场领域创作者")
+        else:
+            logger.warning("    ⚠️ 未找到职场领域创作者选项")
+        time.sleep(1)
+
+    def _fill_maimai_title(self, page: Page, title: str):
+        """填入脉脉标题"""
+        logger.info(f"  填入标题: {title[:20]}...")
+
+        # 策略1：Playwright locator
+        title_input = page.locator('input[placeholder*="标题"]')
+        if title_input.count() > 0:
+            title_input.first.click()
+            title_input.first.fill("")
+            title_input.first.fill(title)
+            logger.success(f"    ✓ 标题已填入: {title}")
+            time.sleep(0.5)
+            return
+
+        # 策略2：JS evaluate
+        filled = page.evaluate('''(title) => {
+            const inputs = document.querySelectorAll('input');
+            for (const input of inputs) {
+                const ph = (input.placeholder || '') + (input.getAttribute('aria-label') || '');
+                if (ph.includes('标题')) {
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    ).set;
+                    nativeInputValueSetter.call(input, title);
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }
+            }
+            return false;
+        }''', title)
+        if filled:
+            logger.success(f"    ✓ 标题已填入: {title}")
+        else:
+            logger.warning("    ⚠️ 未找到标题输入框（标题为选填，继续）")
+        time.sleep(0.5)
+
+    def _fill_maimai_content(self, page: Page, content: str) -> bool:
+        """填入脉脉正文"""
+        logger.info(f"  填入正文: {len(content)} 字")
+        content = content[:1000]
+
+        SELECT_ALL_KEY = "Meta+A" if platform.system() == "Darwin" else "Control+A"
+
+        # 策略1：textarea
+        textarea = page.locator('textarea[placeholder*="想法"], textarea[placeholder*="分享"]')
+        if textarea.count() > 0:
+            textarea.first.click()
+            page.keyboard.press(SELECT_ALL_KEY)
+            page.keyboard.press("Backspace")
+            time.sleep(0.2)
+            textarea.first.fill(content)
+            logger.success(f"    ✓ 正文已填入 (textarea)")
+            time.sleep(0.5)
+            return True
+
+        # 策略2：contenteditable
+        editor = page.locator('[contenteditable="true"]')
+        if editor.count() > 0:
+            editor.first.click()
+            page.keyboard.press(SELECT_ALL_KEY)
+            page.keyboard.press("Backspace")
+            time.sleep(0.2)
+            page.keyboard.type(content, delay=10)
+            logger.success(f"    ✓ 正文已填入 (contenteditable)")
+            time.sleep(0.5)
+            return True
+
+        return False
+
+    def _add_maimai_topic(self, page: Page, topic: str, retries: int = 2):
+        """添加脉脉话题（带重试）"""
+        for attempt in range(retries + 1):
+            logger.info(f"  添加话题: {topic}" + (f"（第 {attempt+1} 次尝试）" if attempt > 0 else ""))
+
+            # 1. 点击「添加话题」按钮
+            clicked = page.evaluate('''() => {
+                const all = document.querySelectorAll('div, span, label');
+                let best = null;
+                let bestArea = Infinity;
+                for (const el of all) {
+                    const t = (el.textContent || '').trim();
+                    const rect = el.getBoundingClientRect();
+                    const cls = (el.className || '').toString();
+                    const area = rect.width * rect.height;
+                    if (t.includes('添加话题') && rect.y > 250 && rect.width > 0
+                        && cls.includes('cursor-pointer')) {
+                        if (area < bestArea) { bestArea = area; best = el; }
+                    }
+                }
+                if (best) { best.click(); return best.textContent.trim(); }
+                for (const el of all) {
+                    const t = (el.textContent || '').trim();
+                    const rect = el.getBoundingClientRect();
+                    if ((t === '添加话题' || t === '# 添加话题') && rect.y > 250 && rect.width < 150) {
+                        el.click(); return t;
+                    }
+                }
+                return false;
+            }''')
+
+            if not clicked:
+                logger.warning("    ⚠️ 未找到「添加话题」按钮")
+                if attempt < retries:
+                    time.sleep(2)
+                    continue
+                return
+
+            time.sleep(2)
+
+            # 2. 在弹出面板的搜索框中输入话题
+            popup_search = None
+            for inp in page.locator('input[type="search"], input[type="text"]').all():
+                try:
+                    box = inp.bounding_box()
+                    if box and box['y'] > 250 and box['width'] > 50:
+                        popup_search = inp
+                        break
+                except Exception:
+                    continue
+
+            if popup_search:
+                popup_search.click()
+                time.sleep(0.3)
+                popup_search.fill(topic)
+                logger.info(f"    已在搜索框输入: {topic}")
+            else:
+                logger.warning("    ⚠️ 未找到搜索框")
+                if attempt < retries:
+                    page.keyboard.press("Escape")
+                    time.sleep(2)
+                    continue
+                return
+
+            time.sleep(2)
+
+            # 3. 点击搜索结果
+            selected = page.evaluate('''(topic) => {
+                const all = document.querySelectorAll('div');
+                let exactRow = null, exactLen = Infinity;
+                let prefixRow = null, prefixLen = Infinity;
+                for (const el of all) {
+                    const t = (el.textContent || '').trim();
+                    const rect = el.getBoundingClientRect();
+                    const cls = (el.className || '').toString();
+                    if (!cls.includes('cursor-pointer') || rect.y < 300 || rect.height < 30 || rect.height > 60) continue;
+                    if (!t.includes(topic)) continue;
+                    if (t.startsWith(topic)) {
+                        if (t.length < exactLen) { exactLen = t.length; exactRow = el; }
+                    } else {
+                        if (t.length < prefixLen) { prefixLen = t.length; prefixRow = el; }
+                    }
+                }
+                const target = exactRow || prefixRow;
+                if (target) {
+                    target.click();
+                    return { match: exactRow ? 'exact' : 'prefix', text: target.textContent.trim().substring(0, 30) };
+                }
+                return null;
+            }''', topic)
+
+            if selected:
+                logger.success(f"    ✓ 话题已点击: {selected.get('text', topic)}")
+            else:
+                logger.warning(f"    ⚠️ 未找到话题搜索结果: {topic}")
+                if attempt < retries:
+                    page.keyboard.press("Escape")
+                    time.sleep(2)
+                    continue
+
+            # 关闭弹窗
+            time.sleep(1)
+            page.keyboard.press("Escape")
+            time.sleep(0.5)
+            return
+
+    def _check_maimai_publish_settings(self, page: Page):
+        """勾选脉脉的两个发布设置开关：同步主页 + 昵称水印"""
+        logger.info("  检查发布设置开关...")
+
+        checked = page.evaluate('''() => {
+            let toggled = 0;
+            // 查找开关：通常是 checkbox 或 toggle 样式的元素
+            // 脉脉的开关是自定义组件，需要通过文字找到对应的开关
+            const labels = ['同步主页', '昵称水印'];
+            for (const label of labels) {
+                const all = document.querySelectorAll('span, div, label');
+                for (const el of all) {
+                    const t = (el.textContent || '').trim();
+                    const rect = el.getBoundingClientRect();
+                    // 找到标签文字附近的开关/checkbox
+                    if (t.includes(label) && rect.y > 300) {
+                        // 查找同级的 checkbox 或 toggle
+                        const parent = el.closest('div[class]') || el.parentElement;
+                        if (parent) {
+                            const checkbox = parent.querySelector('input[type="checkbox"]');
+                            if (checkbox && !checkbox.checked) {
+                                checkbox.click();
+                                toggled++;
+                                continue;
+                            }
+                            // 自定义 toggle：查找圆点指示器
+                            const toggle = parent.querySelector('[class*="toggle"], [class*="switch"], [role="switch"]');
+                            if (toggle) {
+                                const isOff = toggle.getAttribute('aria-checked') === 'false'
+                                    || !toggle.classList.contains('active')
+                                    || toggle.classList.contains('off');
+                                if (isOff) {
+                                    toggle.click();
+                                    toggled++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return toggled;
+        }''')
+
+        if checked > 0:
+            logger.info(f"    ✓ 已勾选 {checked} 个开关")
+        else:
+            logger.info("    开关已是正确状态或未找到")
+        time.sleep(0.5)
+
     def _publish_toutiao(self, page: Page, title: str, content: str) -> bool:
         """
-        在今日头条发布页面填写标题、正文并发布
+        在今日头条发布页面：追加话题标签 + 点击发布
 
-        返回:
-            True 发布成功
+        MultiPost 已经填好了标题和正文，我们只需要：
+          1. 在正文末尾追加 `#上头条 聊热点#` 话题标签
+          2. 点击红色「发布」按钮
         """
-        logger.info("📝 今日头条：填写内容并发布")
+        logger.info("📝 今日头条：追加话题标签并发布")
 
         # 等待页面加载
         try:
             page.wait_for_load_state("domcontentloaded", timeout=10000)
         except Exception:
             logger.warning("  今日头条页面加载超时")
-        time.sleep(3)
+        time.sleep(2)
 
-        self._save_screenshot(page, "toutiao_before_fill")
+        self._save_screenshot(page, "toutiao_before_action")
 
-        # 填标题
-        title_filled = self._fill_platform_title(page, title, "toutiao")
-        if not title_filled:
-            logger.error("  ❌ 今日头条：标题填写失败")
-            self._save_screenshot(page, "toutiao_title_fail")
-            return False
+        # 在已有正文末尾追加话题标签
+        appended = page.evaluate("""() => {
+            // 找到 contenteditable 编辑器
+            const editors = document.querySelectorAll(
+                'div[contenteditable="true"], [role="textbox"], textarea'
+            );
+            for (const editor of editors) {
+                const rect = editor.getBoundingClientRect();
+                if (rect.width > 200 && rect.height > 100) {
+                    editor.focus();
+                    // 将光标移到末尾
+                    const range = document.createRange();
+                    const sel = window.getSelection();
+                    range.selectNodeContents(editor);
+                    range.collapse(false);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    // 追加话题标签
+                    document.execCommand('insertText', false, '\\n\\n#上头条 聊热点#');
+                    return true;
+                }
+            }
+            return false;
+        }""")
+
+        if appended:
+            logger.info("  ✓ 已追加话题标签 #上头条 聊热点#")
+        else:
+            logger.warning("  ⚠️ 未找到编辑器追加话题标签，尝试键盘输入...")
+            # 备用方案：点击编辑器后用键盘输入
+            editor = page.locator('div[contenteditable="true"], [role="textbox"]').first
+            if editor.count() > 0:
+                editor.click()
+                page.keyboard.press("End")
+                page.keyboard.type("\n\n#上头条 聊热点#", delay=10)
+                logger.info("  ✓ 已追加话题标签 (键盘输入)")
+            else:
+                logger.warning("  ⚠️ 未找到编辑器，跳过话题标签追加")
 
         time.sleep(1)
-
-        # 填正文
-        content_filled = self._fill_platform_content(page, content, "toutiao")
-        if not content_filled:
-            logger.error("  ❌ 今日头条：正文填写失败")
-            self._save_screenshot(page, "toutiao_content_fail")
-            return False
-
-        time.sleep(1)
-
-        # TODO: 分类标签选择（需要根据实际页面元素确定选择器）
-        logger.info("  分类标签：暂未实现，跳过")
-
         self._save_screenshot(page, "toutiao_before_publish")
 
-        # 点击发布按钮
-        publish_clicked = page.evaluate('''() => {
-            const btns = document.querySelectorAll('button, a, span');
+        # 点击红色「发布」按钮
+        publish_clicked = page.evaluate("""() => {
+            const btns = document.querySelectorAll('button');
             for (const btn of btns) {
                 const text = (btn.textContent || '').trim();
-                if (text === '发布' || text === '发表' || text === '提交') {
+                const style = getComputedStyle(btn);
+                const rect = btn.getBoundingClientRect();
+                if ((text === '发布' || text === '发表') && rect.width > 0 && rect.height > 0) {
                     btn.click();
                     return text;
                 }
             }
+            // 备用：找红色按钮
+            for (const btn of btns) {
+                const style = getComputedStyle(btn);
+                const rect = btn.getBoundingClientRect();
+                if (style.backgroundColor.includes('255') && rect.width > 40 && rect.width < 200) {
+                    const t = (btn.textContent || '').trim();
+                    if (t.includes('发布') || t.includes('发表') || t === '') {
+                        btn.click();
+                        return t || '红色按钮';
+                    }
+                }
+            }
             return false;
-        }''')
+        }""")
 
         if not publish_clicked:
             logger.warning("  ⚠️ 今日头条：未找到发布按钮")
@@ -649,85 +1196,62 @@ class MultiPostPublisher:
 
     def _publish_wechat(self, page: Page, title: str, content: str) -> bool:
         """
-        在微信公众号发布页面填写标题、正文并发布
+        在微信公众号编辑页面：点击「保存为草稿」
 
-        返回:
-            True 发布成功
+        MultiPost 已经填好了标题和正文，我们只需要：
+          点击「保存为草稿」（⚠️ 不点「群发」或「发表」）
         """
-        logger.info("📝 微信公众号：填写内容并发布")
+        logger.info("📝 微信公众号：保存为草稿")
 
         # 等待页面加载
         try:
             page.wait_for_load_state("domcontentloaded", timeout=10000)
         except Exception:
             logger.warning("  微信公众号页面加载超时")
-        time.sleep(3)
+        time.sleep(2)
 
-        self._save_screenshot(page, "wechat_before_fill")
+        self._save_screenshot(page, "wechat_before_action")
 
-        # 填标题
-        title_filled = self._fill_platform_title(page, title, "wechat")
-        if not title_filled:
-            logger.error("  ❌ 微信公众号：标题填写失败")
-            self._save_screenshot(page, "wechat_title_fail")
-            return False
-
-        time.sleep(1)
-
-        # 填正文（微信公众号编辑器可能在 iframe 中）
-        content_filled = self._fill_wechat_content(page, content)
-        if not content_filled:
-            logger.error("  ❌ 微信公众号：正文填写失败")
-            self._save_screenshot(page, "wechat_content_fail")
-            return False
-
-        time.sleep(1)
-
-        # TODO: 分类标签选择
-        logger.info("  分类标签：暂未实现，跳过")
-
-        self._save_screenshot(page, "wechat_before_publish")
-
-        # 点击发布按钮（微信公众号通常是「群发」或「发布」）
-        publish_clicked = page.evaluate('''() => {
+        # ⚠️ 只点击「保存为草稿」，绝对不点「群发」或「发表」！
+        publish_clicked = page.evaluate("""() => {
             const btns = document.querySelectorAll('button, a, span');
             for (const btn of btns) {
                 const text = (btn.textContent || '').trim();
-                if (text === '群发' || text === '发布' || text === '保存并群发') {
+                if (text === '保存为草稿' || text === '存为草稿' || text === '保存草稿') {
                     btn.click();
                     return text;
                 }
             }
             return false;
-        }''')
+        }""")
 
         if not publish_clicked:
-            logger.warning("  ⚠️ 微信公众号：未找到发布按钮")
-            self._save_screenshot(page, "wechat_publish_btn_fail")
+            logger.warning("  ⚠️ 微信公众号：未找到「保存为草稿」按钮")
+            self._save_screenshot(page, "wechat_save_draft_btn_fail")
             return False
 
-        logger.info(f"  ✓ 微信公众号按钮已点击: {publish_clicked}")
+        logger.info(f"  ✓ 微信公众号「保存为草稿」已点击: {publish_clicked}")
         time.sleep(2)
 
         # 处理确认弹窗
-        confirm_clicked = page.evaluate('''() => {
+        confirm_clicked = page.evaluate("""() => {
             const btns = document.querySelectorAll('button, a, span');
             for (const btn of btns) {
                 const text = (btn.textContent || '').trim();
-                if (text === '确定' || text === '确认群发' || text === '确认') {
+                if (text === '确定' || text === '确认' || text === '确认保存') {
                     btn.click();
                     return text;
                 }
             }
             return false;
-        }''')
+        }""")
 
         if confirm_clicked:
             logger.info(f"  ✓ 确认弹窗已点击: {confirm_clicked}")
             time.sleep(2)
 
-        self._save_screenshot(page, "wechat_after_publish")
-        logger.success("✓ 微信公众号发布完成")
+        self._save_screenshot(page, "wechat_after_save_draft")
+        logger.success("✓ 微信公众号已保存为草稿")
         return True
 
     # ========== 平台通用填写方法 ==========
