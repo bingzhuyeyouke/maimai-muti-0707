@@ -63,8 +63,8 @@ class Settings(BaseSettings):
         description="默认发布平台（逗号分隔），如 weixin,toutiao,zhihu,juejin",
     )
     wechatsync_mcp_path: str = Field(
-        default="/Users/bytedance/claude/Wechatsync/packages/mcp-server/dist/index.js",
-        description="Wechatsync MCP server 路径",
+        default=str(Path.home() / "Wechatsync" / "packages" / "mcp-server" / "dist" / "index.js"),
+        description="Wechatsync MCP server 路径（默认 ~/Wechatsync/packages/mcp-server/dist/index.js）",
     )
     wechatsync_ws_port: int = Field(
         default=9527,

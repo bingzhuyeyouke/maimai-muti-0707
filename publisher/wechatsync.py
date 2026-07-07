@@ -72,7 +72,7 @@ class WechatsyncPublisher:
     def _find_cli(self) -> Optional[str]:
         """查找 Wechatsync CLI 可执行文件"""
         # 1. 检查项目内 CLI
-        cli_path = "/Users/bytedance/claude/Wechatsync/packages/cli/dist/index.js"
+        cli_path = str(Path.home() / "Wechatsync" / "packages" / "cli" / "dist" / "index.js")
         if Path(cli_path).exists():
             return cli_path
 
@@ -105,7 +105,8 @@ class WechatsyncPublisher:
 
         if not self._cli_path:
             logger.error("❌ Wechatsync CLI 不可用")
-            logger.info("请确认已构建 Wechatsync：cd /Users/bytedance/claude/Wechatsync && pnpm build")
+            ws_dir = Path.home() / "Wechatsync"
+            logger.info(f"请确认已构建 Wechatsync：cd {ws_dir} && pnpm build")
             return False
 
         logger.info(f"  ✓ CLI 路径: {self._cli_path}")

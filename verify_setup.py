@@ -15,6 +15,7 @@
 """
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -82,7 +83,7 @@ def main():
 
     # ===== 2. Wechatsync 项目 =====
     print(f"{BLUE}📦 Wechatsync 项目{RESET}")
-    ws_path = Path("/Users/bytedance/claude/Wechatsync")
+    ws_path = Path.home() / "Wechatsync"
     check("项目目录", ws_path.exists(),
           str(ws_path) if ws_path.exists() else "未克隆 — git clone https://github.com/wechatsync/Wechatsync.git")
 
@@ -107,7 +108,7 @@ def main():
     if cdp_ok:
         try:
             # 方法1：通过扩展目录检查
-            ext_dir = Path("/tmp/chrome-automation-profile/Default/Extensions")
+            ext_dir = Path(os.environ.get("TEMP", "/tmp")) / "chrome-automation-profile" / "Default" / "Extensions"
             ext_found = False
             if ext_dir.exists():
                 for ext_id_dir in ext_dir.iterdir():
@@ -183,7 +184,7 @@ def main():
     print(f"{BLUE}🔑 MCP Token 配置{RESET}")
 
     # 读取 .env 中的 Token
-    env_path = Path("/Users/bytedance/claude/media-assistant/.env")
+    env_path = PROJECT_ROOT / ".env"
     env_token = ""
     if env_path.exists():
         for line in env_path.read_text().splitlines():
@@ -195,7 +196,7 @@ def main():
           f"已配置 ({env_token[:8]}...)" if env_token else "未配置")
 
     # 读取 .mcp.json 中的 Token
-    mcp_json_path = Path("/Users/bytedance/claude/media-assistant/.mcp.json")
+    mcp_json_path = PROJECT_ROOT / ".mcp.json"
     mcp_token = ""
     if mcp_json_path.exists():
         try:

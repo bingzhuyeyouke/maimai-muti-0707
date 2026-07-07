@@ -1,41 +1,44 @@
 """
-闪电观察者模式 — 粘贴 DeepSeek 输出，按话题批量发到脉脉
+闪电观察者模式 — 粘贴 DeepSeek 输出，按话题批量发帖
 
-与爆料活动的区别：
-  - 话题不固定，按运营给的热点名称搜索
-  - 每个话题2篇文章，共享1张网络搜索配图
-  - 间隔更短（1-2分钟）
+支持两种发布模式：
+  - 默认：纯脉脉发布（MaimaiPoster）
+  - --multi：MultiPost 多平台发布（脉脉+头条+公众号）
 
 用法：
-  方式1: 从文件读取
+  方式1: 从文件读取（纯脉脉）
     python3 shandian_post.py --file shandian.txt
 
-  方式2: 交互式（推荐）
-    python3 shandian_post.py
-    然后粘贴 DeepSeek 输出，输入 END 结束
+  方式2: MultiPost 多平台发布（脉脉+头条+公众号）
+    python3 shandian_post.py --file shandian.txt --multi
 
   方式3: 干跑预览
     python3 shandian_post.py --file shandian.txt --dry-run
 
+  方式4: 不带图
+    python3 shandian_post.py --file shandian.txt --no-image
+
 输入格式（DeepSeek 输出直接复制）：
   ## 话题名称1
 
-  **第一篇｜标题1**
+  ### 第一篇
 
-  正文段落1
+  **标题**
 
-  正文段落2
+  正文...
 
-  **第二篇｜标题2**
+  ### 第二篇
 
-  正文段落1
+  **标题**
+
+  正文...
 
   ## 话题名称2
   ...
 
 前置条件：
   1. Chrome 带调试端口启动: python3 start_chrome.py
-  2. 已登录脉脉
+  2. 已登录脉脉（纯脉脉模式）/ 已登录 MultiPost + 各平台（--multi 模式）
   3. .env 配置 PEXELS_API_KEY（搜图用，无key则不发图）
 """
 
@@ -48,6 +51,7 @@ from loguru import logger
 
 from config import settings, PROJECT_ROOT
 from publisher.maimai import MaimaiPoster
+from publisher.multipost import MultiPostPublisher
 from adapter.image_search import search_and_download
 
 
@@ -158,9 +162,10 @@ def parse_shandian(text: str) -> List[Dict]:
 
 # ========== 图片搜索与配对 ==========
 
-def search_topic_images(posts: List[Dict], skip_image: bool = False, pexels_only: bool = False) -> Dict[str, List[str]]:
+def search_topic_images(posts: List[Dict], skip_image: bool = False) -> Dict[str, List[str]]:
     """
     为每个话题搜索1张配图，同话题的2篇文章共享
+    默认优先走 Pexels API，不走百度网页搜图
 
     返回:
         {话题名称: [图片路径]} 的映射
@@ -191,6 +196,14 @@ def search_topic_images(posts: List[Dict], skip_image: bool = False, pexels_only
         '梅西登顶世界杯历史射手王': 'Messi World Cup goal celebration',
         '你的世界杯入坑之战是哪一场': 'World Cup football fans stadium',
         '马斯克身家超过140个国家GDP': 'Elon Musk SpaceX rocket launch',
+        '曝Claude脑子里长出"意识"': 'AI artificial intelligence brain neural network',
+        '前华为智驾大模型负责人入局具身智能': 'humanoid robot AI autonomous driving',
+        '小米调整小爱同学：负责人调任机器人业务': 'Xiaomi AI assistant smart home robot',
+        '特朗普说比利时赢球有黑幕': 'Trump political controversy football soccer',
+        '比利时官方发文嘲讽美国': 'Belgium football soccer victory celebration',
+        '高德打车：已首批接入支付宝AI开放平台': 'Alipay AI ride hailing mobile payment',
+        '淘宝闪购内测社交App亮圈，你看好吗': 'social networking app mobile community',
+        '微软游戏CEO回应裁员：为了美好未来': 'Microsoft Xbox gaming layoff corporate',
     }
 
     logger.info(f"🔍 搜索图片: 共 {len(unique_topics)} 个话题...")
@@ -208,7 +221,7 @@ def search_topic_images(posts: List[Dict], skip_image: bool = False, pexels_only
         pexels_q = pexels_queries.get(topic)  # 英文关键词
         img_path = search_and_download(
             topic, img_dir,
-            skip_web=pexels_only,
+            skip_web=True,  # 默认优先走 Pexels API，不走百度网页搜图
             pexels_query=pexels_q,
         )
         topic_images[topic] = [img_path] if img_path else []
@@ -224,11 +237,16 @@ def run(
     file_path: str = None,
     dry_run: bool = False,
     skip_image: bool = False,
-    pexels_only: bool = False,
+    multi: bool = False,
 ):
-    """闪电观察者主流程"""
+    """闪电观察者主流程
+
+    参数:
+        multi: True = 走 MultiPost 多平台发布（脉脉+头条+公众号），False = 纯脉脉
+    """
+    mode_label = "MultiPost 多平台" if multi else "脉脉"
     logger.info("=" * 55)
-    logger.info("⚡ 闪电观察者模式")
+    logger.info(f"⚡ 闪电观察者模式（{mode_label}）")
     logger.info("=" * 55)
 
     # 获取文本内容
@@ -261,8 +279,8 @@ def run(
     # 统计话题数
     unique_topics = list(dict.fromkeys(p['topic'] for p in posts))
 
-    # 搜索图片
-    topic_images = search_topic_images(posts, skip_image, pexels_only)
+    # 搜索图片（默认走 Pexels API）
+    topic_images = search_topic_images(posts, skip_image)
 
     # 配对图片
     for post in posts:
@@ -276,39 +294,76 @@ def run(
         logger.info(f"    正文({len(post['content'])}字): {post['content'][:60]}...")
         logger.info(f"    图片: {len(post.get('image_paths', []))} 张")
 
-    # 发布
-    logger.info("🚀 开始发布到脉脉...")
-    poster = MaimaiPoster()
-    if not poster.connect():
-        logger.error("❌ 连接 Chrome 失败")
-        return False
+    if multi:
+        # ===== MultiPost 多平台发布（脉脉+头条+公众号）=====
+        logger.info("🚀 开始 MultiPost 多平台发布（脉脉+头条+公众号）...")
+        publisher = MultiPostPublisher()
+        if not publisher.connect():
+            logger.error("❌ 连接 Chrome 失败")
+            return False
 
-    try:
-        result = poster.batch_post(
-            posts=[
-                {
-                    "content": p['content'][:1000],
-                    "title": "",  # 闪电观察者不填标题，直接发正文
-                    "image_paths": p.get('image_paths', []),
-                    "topic": p.get('topic', ''),
-                }
-                for p in posts
-            ],
-            interval=settings.shandian_post_interval,
-            dry_run=dry_run,
-        )
-    except Exception as e:
-        logger.error(f"❌ 批量发帖异常: {e}")
+        try:
+            result = publisher.batch_post(
+                posts=[
+                    {
+                        "title": p['title'],  # MultiPost 必须填标题！
+                        "body": p['content'][:1000],
+                        "image_paths": p.get('image_paths', []),
+                        "topic": p.get('topic', ''),
+                    }
+                    for p in posts
+                ],
+                platforms=["脉脉", "微信公众号", "今日头条"],
+                interval=settings.multipost_post_interval,
+                dry_run=dry_run,
+            )
+        except Exception as e:
+            logger.error(f"❌ MultiPost 批量发布异常: {e}")
+            publisher.disconnect()
+            return False
+
+        publisher.disconnect()
+
+        logger.info("=" * 55)
+        logger.info(f"🏁 完成: 成功 {result['success']}, 失败 {result['failed']}")
+        logger.info("=" * 55)
+
+        return result['failed'] == 0
+
+    else:
+        # ===== 纯脉脉发布 =====
+        logger.info("🚀 开始发布到脉脉...")
+        poster = MaimaiPoster()
+        if not poster.connect():
+            logger.error("❌ 连接 Chrome 失败")
+            return False
+
+        try:
+            result = poster.batch_post(
+                posts=[
+                    {
+                        "content": p['content'][:1000],
+                        "title": "",  # 纯脉脉模式：不填标题，直接发正文
+                        "image_paths": p.get('image_paths', []),
+                        "topic": p.get('topic', ''),
+                    }
+                    for p in posts
+                ],
+                interval=settings.shandian_post_interval,
+                dry_run=dry_run,
+            )
+        except Exception as e:
+            logger.error(f"❌ 批量发帖异常: {e}")
+            poster.disconnect()
+            return False
+
         poster.disconnect()
-        return False
 
-    poster.disconnect()
+        logger.info("=" * 55)
+        logger.info(f"🏁 完成: 成功 {result['success']}, 失败 {result['failed']}")
+        logger.info("=" * 55)
 
-    logger.info("=" * 55)
-    logger.info(f"🏁 完成: 成功 {result['success']}, 失败 {result['failed']}")
-    logger.info("=" * 55)
-
-    return result['failed'] == 0
+        return result['failed'] == 0
 
 
 # ========== 入口 ==========
@@ -318,31 +373,31 @@ if __name__ == "__main__":
 
     import argparse
 
-    cli = argparse.ArgumentParser(description="闪电观察者 — 粘贴DeepSeek输出，按话题批量发到脉脉")
+    cli = argparse.ArgumentParser(description="闪电观察者 — 粘贴DeepSeek输出，按话题批量发帖")
     cli.add_argument("--posts", type=str, help="直接传入帖子内容")
     cli.add_argument("--file", type=str, help="从文件读取帖子内容")
     cli.add_argument("--dry-run", action="store_true", help="干跑模式")
     cli.add_argument("--no-image", action="store_true", help="跳过图片搜索")
-    cli.add_argument("--pexels-only", action="store_true", help="只用Pexels搜图（跳过网页搜图，避免Playwright冲突）")
+    cli.add_argument("--multi", action="store_true", help="MultiPost 多平台发布（脉脉+头条+公众号），默认只发脉脉")
 
     args = cli.parse_args()
 
     if not args.posts and not args.file:
         # 交互模式
-        success = run(dry_run=args.dry_run, skip_image=args.no_image, pexels_only=args.pexels_only)
+        success = run(dry_run=args.dry_run, skip_image=args.no_image, multi=args.multi)
     elif args.file:
         success = run(
             file_path=args.file,
             dry_run=args.dry_run,
             skip_image=args.no_image,
-            pexels_only=args.pexels_only,
+            multi=args.multi,
         )
     else:
         success = run(
             text=args.posts,
             dry_run=args.dry_run,
             skip_image=args.no_image,
-            pexels_only=args.pexels_only,
+            multi=args.multi,
         )
 
     sys.exit(0 if success else 1)
