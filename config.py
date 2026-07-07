@@ -34,8 +34,8 @@ class Settings(BaseSettings):
 
     # ---------- MultiPost 多平台发布 ----------
     multipost_post_interval: int = Field(
-        default=180,
-        description="MultiPost 发帖间隔基准（秒），±30秒抖动，默认180秒≈3分钟，与脉脉发帖节奏同步",
+        default=90,
+        description="MultiPost 发帖间隔基准（秒），±30秒抖动，默认90秒≈1.5分钟",
     )
     pexels_api_key: str = Field(
         default="",
