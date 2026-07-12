@@ -42,6 +42,9 @@ from publisher.maimai import MaimaiPageOps, MAIMAI_HOME_URL, DEFAULT_TOPIC
 
 # ========== 常量 ==========
 
+# 跨平台判断（需在 DEDICATED_USER_DATA 之前定义）
+IS_WINDOWS = platform.system() == "Windows"
+
 # Chrome 远程调试地址（默认，connect 时可能被覆盖）
 DEFAULT_CDP_URL = "http://localhost:9222"
 
@@ -64,7 +67,6 @@ MULTIPOST_EXT_ID = "dhohkaclnjgcikfoaacfgijgjgceofih"
 TOUTIAO_HASHTAG = "#上头条 聊热点#"
 
 # 跨平台 Chrome 路径
-IS_WINDOWS = platform.system() == "Windows"
 if IS_WINDOWS:
     CHROME_PATHS = [
         os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
